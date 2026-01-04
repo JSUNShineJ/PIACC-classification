@@ -1,0 +1,573 @@
+---
+title: "PIAAC"
+output: html_document
+date: "2025-10-11"
+---
+
+```{r}
+library(tidyverse)
+library(dplyr)
+library(readxl)
+library(VIM)
+library(xgboost)
+library(Matrix)
+library(themis) 
+library(caret)
+library(rsample)
+library(pROC)
+library(smotefamily)
+```
+
+## 记录原始数据
+```{r}
+PIAAC <- read_csv("PIAAC_US_2012_subsample.csv", show_col_types = FALSE)
+Info <- read_excel("Variable information.xlsx", sheet = "variable information")
+Values <- read_excel("Variable information.xlsx", sheet = "variable values")|>
+  dplyr::slice(2:(n() - 1)) |>
+  fill(1, .direction = "down")
+
+Values[[2]] <- ifelse(
+  grepl("^\\s*\\d+(?:\\.\\d+)?[A-Za-z]+\\s*$", Values[[2]]),
+  stringr::str_extract(Values[[2]], "\\d+"),  
+  Values[[2]]                                 
+)
+
+#把ALL ZERO RESPONSE 统一成0
+all_zero_codes <- Values %>%
+  filter(...3 == "All zero response") %>%   
+  pull(`Variable Values`)  
+
+PIAAC <- PIAAC %>%
+  mutate(across(
+    all_of(all_zero_codes),                         
+    ~ ifelse(as.character(.) == "9999", 0, .)        
+  ))
+```
+
+## 数据清洗第一步：查找各数据的缺失值
+
+```{r}
+
+target_labels <- c(
+  "Student in regular cycle of studies",
+  "Did not participate",
+  "Not reached/Not attempted",
+  "Valid skip",
+  "Don't know",
+  "Refused",
+  "Not stated or inferred",
+  "No paid work for past 5 years"
+)
+
+vars <- intersect(names(PIAAC), unique(Values$`Variable Values`))
+out  <- vector("list", length(vars))
+
+for (i in 1:length(vars)) {
+  v <- vars[i]
+  
+  codes <- Values %>%
+    filter(`Variable Values` == v, ...3 %in% target_labels) %>%
+    pull(...2) %>%
+    unique()
+
+  x <- str_squish(as.character(PIAAC[[v]]))
+  x <- sub("\\.0+$", "", x)   # set 9999.00000 to 9999
+  x[x == ""] <- NA
+  
+  total <- length(x)                
+  hit   <- sum(is.na(x) | x %in% codes)
+  prop  <- hit / total
+  
+  out[[i]] <- tibble(variable = v, total = total, hit = hit, prop = prop)
+}
+
+res_nullprob <- bind_rows(out)
+
+uncovered_vars <- setdiff(names(PIAAC), res_nullprob$variable)
+PIAAC_uncovered <- PIAAC %>%
+  select(all_of(uncovered_vars))
+
+uncovered_info <- Info %>%
+  filter(`Variable Information` %in% uncovered_vars)
+
+
+uncovered_nullprob <- tibble(
+  variable = uncovered_vars,
+  total    = sapply(uncovered_vars, function(v) length(PIAAC[[v]])),
+  hit = sapply(uncovered_vars, function(v) sum(is.na(PIAAC[[v]])))
+) %>%
+  mutate(prop = hit / total)
+
+res_nullprob <- bind_rows(res_nullprob,uncovered_nullprob) %>%
+   arrange(desc(prop))
+```
+
+
+```{r}
+remove_var <- res_nullprob %>%
+  filter(prop > 0.35) %>%
+  pull(variable)
+
+PIAAC_phase1 <- PIAAC %>%
+  select(-all_of(remove_var))
+
+cat("被删掉的列：\n", paste(remove_var, collapse = ", "), "\n")
+
+cat("共删除了", length(remove_var), "列\n")
+
+```
+
+#然后选出prop大于0.35,且存在缺失值的列，把缺失值用KNN的方法填上
+
+```{r}
+
+KNN_vars <- res_nullprob %>%
+  filter(prop <= 0.35 & prop > 0) %>%
+  pull(variable) 
+
+cat("There are (", length(KNN_vars), ") that need to be filled by KNN：\n",
+    paste(KNN_vars, collapse = ", "), "\n", sep = "")
+
+
+```
+
+#先把9995，9996等统一成NA值
+```{r}
+PIAAC_phase1_na <- PIAAC_phase1
+
+for (i in 1:length(KNN_vars)){
+   v <- KNN_vars[i]
+   codes <- Values %>%
+    filter(`Variable Values` == v, ...3 %in% target_labels) %>%
+    pull(...2) %>%
+    unique()
+   
+   x <- PIAAC_phase1_na[[v]]
+   x <- sub("\\.0+$", "", x)   # set 9999.00000 to 9999
+   x[x == ""] <- NA
+   
+   x[x %in% codes] <- NA
+
+   PIAAC_phase1_na[[v]] <- x
+}
+```
+
+
+```{r}
+set.seed(123)
+PIAAC_phase2 <- VIM::kNN(
+  data     = PIAAC_phase1_na,
+  variable = KNN_vars,
+  k        = 5,
+  imp_var  = FALSE
+)
+```
+
+```{r}
+PIAAC_phase2_num <- PIAAC_phase2 %>%
+  mutate(across(where(is.character), ~ {
+    y <- suppressWarnings(as.numeric(.))
+    if (any(is.na(y))) . else y
+  }))
+
+cha <- names(PIAAC_phase2_num)[sapply(PIAAC_phase2_num, \(x) !is.numeric(x) )]
+
+cat("There are (", length(cha), ") non-numeric variables：\n",
+    paste(cha, collapse = ", "), "\n", sep = "")
+```
+
+```{r}
+
+df_num <- PIAAC_phase2_num %>% dplyr::select(where(is.numeric))
+
+zero_sd <- names(df_num)[vapply(df_num, function(x) sd(x) == 0, logical(1))]
+
+cat("There are (", length(zero_sd), ") variables whose sd = 0：\n",
+    paste(zero_sd, collapse = ", "), "\n", sep = "")
+
+df_num2 <- dplyr::select(df_num, -dplyr::all_of(zero_sd))
+cor_mat <- cor(df_num2, use = "complete.obs", method = "pearson")  
+
+corr_ps <- cor_mat[, "PS_class"]
+
+corr_ps_sorted <- sort(abs(corr_ps), decreasing = TRUE)
+print(corr_ps_sorted)
+
+```
+
+```{r}
+
+low_corr_vars <- names(corr_ps_sorted[corr_ps_sorted < 0.2])
+
+
+PIAAC_phase3 <- df_num2[ , !(names(df_num2) %in% low_corr_vars)]
+
+length(low_corr_vars)
+```
+
+```{r}
+X <- PIAAC_phase3 %>% select(-all_of("PS_class"))
+cor_mat_P3 <- cor(X)
+abs_cor_P3 <- abs(cor_mat_P3)
+thr <- 0.85
+abs_cor_P3[lower.tri(abs_cor_P3, diag = TRUE)] <- 0
+pairs_idx <- which(abs_cor_P3 > thr, arr.ind = TRUE)
+
+to_drop <- unique(colnames(abs_cor_P3)[pairs_idx[, "col"]])
+
+PIAAC_phase4 <- PIAAC_phase3[, !(names(PIAAC_phase3) %in% to_drop)]
+```
+
+
+#Base XGBoost
+```{r}
+set.seed(2025)
+
+df <- PIAAC_phase4
+df$PS_class <- as.factor(df$PS_class)
+
+idx <- createDataPartition(df$PS_class, p = 0.8, list = FALSE)
+train_df <- df[idx, ]
+test_df  <- df[-idx, ]
+
+#set model matrix
+X_train <- model.matrix(PS_class ~ . , data = train_df)[, -1]
+X_test  <- model.matrix(PS_class ~ . , data = test_df)[, -1]
+
+y_train <- as.integer(train_df$PS_class) - 1L 
+y_test  <- as.integer(test_df$PS_class) - 1L
+num_class <- length(levels(df$PS_class))
+
+dtrain <- xgb.DMatrix(data = X_train, label = y_train)
+dvalid <- xgb.DMatrix(data = X_test,  label = y_test)
+watch  <- list(train = dtrain, eval = dvalid)
+
+params <- list(
+  objective = "multi:softprob",
+  num_class = num_class,
+  eval_metric = c("mlogloss","merror"),
+  eta = 0.05,
+  max_depth = 6,
+  min_child_weight = 3,
+  subsample = 0.8,
+  colsample_bytree = 0.8,
+  gamma = 0,          
+  lambda = 1,         
+  alpha = 0           
+)
+
+fit <- xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = 2000,
+  watchlist = watch,
+  print_every_n = 50
+)
+
+prob <- predict(fit, newdata = dvalid)                
+prob <- matrix(prob, ncol = num_class, byrow = TRUE)
+pred <- max.col(prob) - 1L
+
+acc  <- mean(pred == y_test)
+acc
+
+
+table(Pred = pred, True = y_test)
+
+
+imp <- xgb.importance(model = fit, feature_names = colnames(X_train))
+head(imp, 20)
+
+
+```
+
+# XGBoost
+```{r}
+df <- PIAAC_phase4
+df$PS_class <- factor(df$PS_class)  
+
+set.seed(2025)
+split  <- initial_split(df, prop = 0.8, strata = PS_class)
+train_df <- training(split)
+test_df  <- testing(split)
+
+
+table(train_df$PS_class)
+
+rec <- recipe(PS_class ~ ., data = train_df) |>
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) |>
+  step_smote(PS_class, over_ratio = 1, neighbors = 5)
+
+prep_rec <- prep(rec)                
+train_smote <- juice(prep_rec)       
+test_baked  <- bake(prep_rec, new_data = test_df)  
+
+table(train_smote$PS_class)
+
+X_train <- train_smote |> select(-PS_class) |> as.matrix()
+y_train <- as.integer(train_smote$PS_class) - 1L
+
+X_test  <- test_baked  |> select(-PS_class) |> as.matrix()
+y_test  <- as.integer(test_baked$PS_class) - 1L
+
+num_class <- length(levels(df$PS_class))
+dtrain <- xgb.DMatrix(data = X_train, label = y_train)
+dvalid <- xgb.DMatrix(data = X_test,  label = y_test)
+
+params <- list(
+  objective = "multi:softprob",
+  num_class = num_class,
+  eval_metric = c("mlogloss","merror"),
+  eta = 0.05,
+  max_depth = 6,
+  min_child_weight = 3,
+  subsample = 0.8,
+  colsample_bytree = 0.8,
+  lambda = 1, alpha = 0
+)
+
+fit <- xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = 200,
+  watchlist = list(train = dtrain, eval = dvalid),
+  early_stopping_rounds = 50,
+  print_every_n = 50
+)
+
+prob <- predict(fit, dvalid)
+prob <- matrix(prob, ncol = num_class, byrow = TRUE)
+pred <- max.col(prob) - 1L
+
+acc <- mean(pred == y_test); acc
+tab <- table(Pred = pred, True = y_test); tab
+
+cm <- confusionMatrix(
+  factor(pred, levels = 0:(num_class-1)),
+  factor(y_test, levels = 0:(num_class-1))
+)
+cm$overall["Kappa"]
+imp <- xgb.importance(model = fit, feature_names = colnames(X_train))
+
+cm$byClass <- subset(
+  cm$byClass,
+  select = c("Sensitivity", "Specificity", "Pos Pred Value", "Neg Pred Value", "Precision", "Recall", "F1","Balanced Accuracy")
+)
+print(cm$byClass)
+
+set.seed(2025)
+K <- 5
+
+folds <- createFolds(y_train, k = K, list = TRUE)
+acc_vec <- numeric(length(folds)) 
+
+for (i in seq_along(folds)) {
+  valid_idx <- folds[[i]]
+  train_idx <- setdiff(seq_along(y_train), valid_idx)
+
+  dtr <- xgb.DMatrix(data = X_train[train_idx, ], label = y_train[train_idx])
+  dvl <- xgb.DMatrix(data = X_train[valid_idx, ],  label = y_train[valid_idx])
+
+  fit_fold <- xgb.train(
+    params = params,
+    data = dtr,
+    nrounds = 200,  
+    watchlist = list(train = dtrain, eval = dvalid),
+    early_stopping_rounds = 50,
+    verbose = 0
+  )
+
+  pred_fold <- predict(fit_fold, dvl)
+  pred_fold <- matrix(pred_fold, ncol = num_class, byrow = TRUE)
+  pred_fold <- max.col(pred_fold) - 1L
+
+  acc_vec[i] <- mean(pred_fold == y_train[valid_idx])
+  cat("Fold", i, "Acc:", acc_vec[i], "\n")
+}
+
+acc_mean <- mean(acc_vec)
+acc_sd <- sd(acc_vec)
+cat(sprintf("%d fold average accuracy  = %.4f ± %.4f\n", K, acc_mean, acc_sd))
+head(imp, 20)
+```
+#Base Random forest
+```{r}
+set.seed(2025)
+
+PIAAC_phase4$PS_class <- as.factor(PIAAC_phase4$PS_class)
+
+idx <- createDataPartition(PIAAC_phase4$PS_class, p = 0.8, list = FALSE)
+train_df <- PIAAC_phase4[idx, ]
+test_df  <- PIAAC_phase4[-idx, ]
+
+p <- ncol(train_df) - 1
+rf_fit <- ranger(
+  formula         = PS_class ~ .,
+  data            = train_df,
+  num.trees       = 500,
+  mtry            = max(1, floor(sqrt(p))),
+  min.node.size   = 5,
+  importance      = "impurity",
+  classification  = TRUE,
+  probability     = TRUE,          
+  respect.unordered.factors = "order"  
+)
+
+pred_prob <- predict(rf_fit, data = test_df)$predictions               
+pred_cls  <- colnames(pred_prob)[max.col(pred_prob, ties.method="first")] 
+pred_cls  <- factor(pred_cls, levels = levels(test_df$PS_class))
+
+cm <- confusionMatrix(pred_cls, test_df$PS_class)  # confusion matrix
+print(cm)
+
+```
+
+
+#Random forest
+```{r}
+set.seed(2025)
+
+PIAAC_phase4$PS_class <- as.factor(PIAAC_phase4$PS_class)
+
+PIAAC_phase4$PS_class <- factor(PIAAC_phase4$PS_class,
+                                levels = c("0", "1", "2", "3"),
+                                labels = c("Class_0", "Class_1", "Class_2", "Class_3"))
+
+idx <- createDataPartition(PIAAC_phase4$PS_class, p = 0.8, list = FALSE)
+train_df <- PIAAC_phase4[idx, ]
+test_df  <- PIAAC_phase4[-idx, ]
+
+#SMOTE
+X_train <- train_df %>% dplyr::select(-PS_class)
+y_train <- train_df$PS_class
+
+y_train_int <- as.integer(y_train)
+
+smote_result <- SMOTE(X_train, y_train_int, K = 5)# K=5
+
+X_smote <- smote_result$data[, -ncol(smote_result$data)]
+y_smote <- smote_result$data$class
+
+label_map <- levels(y_train)
+smote_labels <- factor(y_smote, labels = label_map)
+
+train_smote <- cbind(X_smote, PS_class = smote_labels)
+
+train_control <- trainControl(
+  method = "cv",          # Cross-validation
+  number = 5,             
+  classProbs = TRUE,    
+  verboseIter = TRUE,     
+  savePredictions = "final"
+)
+
+grid <- expand.grid(
+  mtry = c(3, 5, 7, 10, 15),
+  splitrule = "gini",
+  min.node.size = c(1, 5, 10)
+)
+
+rf_model <- train(
+  PS_class ~ .,
+  data = train_smote,
+  method = "ranger",
+  trControl = train_control,
+  tuneGrid = grid,
+  num.trees = 500,
+  importance = 'impurity',
+  metric = "Accuracy"
+)
+
+print(rf_model$bestTune)
+
+pred_prob <- predict(rf_model, newdata = test_df, type = "prob")
+pred_cls <- predict(rf_model, newdata = test_df)
+
+# confusion matrix
+confusion <- confusionMatrix(pred_cls, test_df$PS_class)
+print(confusion)
+
+vi <- varImp(rf_model)    
+print(vi, top = 20)
+plot(vi, top = 20)  
+```
+
+#ROC Curves
+```{r}
+
+roc_XG_0 <- roc(as.numeric(y_test == 0),  prob[,1])
+roc_XG_1 <- roc(as.numeric(y_test == 1),  prob[,2])
+roc_XG_2 <- roc(as.numeric(y_test == 2),  prob[,3])
+roc_XG_3 <- roc(as.numeric(y_test == 3),  prob[,4])
+
+roc_rf_0 <- roc(as.numeric(test_df$PS_class == 'Class_0'),  pred_prob[,1])
+roc_rf_1 <- roc(as.numeric(test_df$PS_class == 'Class_1'),  pred_prob[,2])
+roc_rf_2 <- roc(as.numeric(test_df$PS_class == 'Class_2'),  pred_prob[,3])
+roc_rf_3 <- roc(as.numeric(test_df$PS_class == 'Class_3'),  pred_prob[,4])
+```
+
+```{r}
+plot(1 - roc_XG_0$specificities,
+     roc_XG_0$sensitivities,
+     type = "l",
+     col = "blue",
+     lwd = 2,
+     xlab = "FNR",
+     xlim = c(0, 1),
+     main = "ROC Curves for XGBoost")
+
+lines(1 - roc_XG_1$specificities, roc_XG_1$sensitivities, col = "red", lwd = 2) 
+
+lines(1 - roc_XG_2$specificities, roc_XG_2$sensitivities, col = "green", lwd = 2)
+
+lines(1 - roc_XG_3$specificities, roc_XG_3$sensitivities, col = "purple", lwd = 2)
+
+abline(a = 0, b = 1, lty = 2, col = "gray")
+
+auc_XG_0 <- auc(roc_XG_0)
+auc_XG_1 <- auc(roc_XG_1)
+auc_XG_2 <- auc(roc_XG_2)
+auc_XG_3 <- auc(roc_XG_3)
+legend("bottomright",
+       legend = c(
+         sprintf("Class 0 (AUC = %.3f)", auc_XG_0),
+         sprintf("Class 1 (AUC = %.3f)", auc_XG_1),
+         sprintf("Class 2 (AUC = %.3f)", auc_XG_2),
+         sprintf("Class 3 (AUC = %.3f)", auc_XG_3)
+       ),
+       col = c("blue","red","green","purple"),
+       lwd = 2, cex = 0.9, bg = "white")
+```
+```{r}
+plot(1 - roc_rf_0$specificities,
+     roc_rf_0$sensitivities,
+     type = "l",
+     col = "blue",
+     lwd = 2,
+     xlab = "FNR",
+     xlim = c(0, 1),
+     main = "ROC Curves for Randomforest")
+
+lines(1 - roc_rf_1$specificities, roc_rf_1$sensitivities, col = "red", lwd = 2)
+
+lines(1 - roc_rf_2$specificities, roc_rf_2$sensitivities, col = "green", lwd = 2)
+
+lines(1 - roc_rf_3$specificities, roc_rf_3$sensitivities, col = "purple", lwd = 2)
+
+abline(a = 0, b = 1, lty = 2, col = "gray")
+
+auc_rf_0 <- auc(roc_rf_0)
+auc_rf_1 <- auc(roc_rf_1)
+auc_rf_2 <- auc(roc_rf_2)
+auc_rf_3 <- auc(roc_rf_3)
+legend("bottomright",
+       legend = c(
+         sprintf("Class 0 (AUC = %.3f)", auc_rf_0),
+         sprintf("Class 1 (AUC = %.3f)", auc_rf_1),
+         sprintf("Class 2 (AUC = %.3f)", auc_rf_2),
+         sprintf("Class 3 (AUC = %.3f)", auc_rf_3)
+       ),
+       col = c("blue","red","green","purple"),
+       lwd = 2, cex = 0.9, bg = "white")
+```
+
