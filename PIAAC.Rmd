@@ -18,7 +18,7 @@ library(pROC)
 library(smotefamily)
 ```
 
-## 记录原始数据
+## Raw data
 ```{r}
 PIAAC <- read_csv("PIAAC_US_2012_subsample.csv", show_col_types = FALSE)
 Info <- read_excel("Variable information.xlsx", sheet = "variable information")
@@ -32,7 +32,7 @@ Values[[2]] <- ifelse(
   Values[[2]]                                 
 )
 
-#把ALL ZERO RESPONSE 统一成0
+#set ALL ZERO RESPONSE to 0
 all_zero_codes <- Values %>%
   filter(...3 == "All zero response") %>%   
   pull(`Variable Values`)  
@@ -44,7 +44,7 @@ PIAAC <- PIAAC %>%
   ))
 ```
 
-## 数据清洗第一步：查找各数据的缺失值
+## data cleaning: find missing values
 
 ```{r}
 
@@ -111,13 +111,13 @@ remove_var <- res_nullprob %>%
 PIAAC_phase1 <- PIAAC %>%
   select(-all_of(remove_var))
 
-cat("被删掉的列：\n", paste(remove_var, collapse = ", "), "\n")
+cat("columns deleted：\n", paste(remove_var, collapse = ", "), "\n")
 
-cat("共删除了", length(remove_var), "列\n")
+cat("deleted", length(remove_var), "columns\n")
 
 ```
 
-#然后选出prop大于0.35,且存在缺失值的列，把缺失值用KNN的方法填上
+#select columns with a prop less than or equal to 0.35 and have missing values， use KNN to fill missing values
 
 ```{r}
 
@@ -131,7 +131,7 @@ cat("There are (", length(KNN_vars), ") that need to be filled by KNN：\n",
 
 ```
 
-#先把9995，9996等统一成NA值
+#set 9995，9996... to NA
 ```{r}
 PIAAC_phase1_na <- PIAAC_phase1
 
